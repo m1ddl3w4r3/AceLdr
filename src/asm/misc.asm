@@ -2,7 +2,7 @@
 
 GLOBAL GetIp
 GLOBAL Stub
-
+GLOBAL GetRet
 
 [SECTION .text$C]
 
@@ -10,7 +10,16 @@ Stub:
     dq    0
     dq    0
     dq    0
+    dq    0
+    dq    0
+    dq    0
+    dq    0
+    dq    0
+    dq    0;
 
+[SECTION .text$D]
+GetRet:
+    ret
 
 [SECTION .text$F]
 
